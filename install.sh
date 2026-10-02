@@ -18,10 +18,10 @@ assets() {
     # Updated only after reviewing the private release and its checksums.
     cat <<'ASSETS'
 # BEGIN RELEASE ASSETS
-client:x86_64-unknown-linux-gnu 606436787 74181d6bfd987ccf6a26b9955d2bad53ed78ea09850ba14d185fd2e0458cb71d
-client:x86_64-apple-darwin 606436766 e080c664afec9e975cbb7ee77e1fc4124083c0bca09e9bc0f6858368ff168403
-client:aarch64-apple-darwin 606436770 4ca7db7e13a9fdb91c956475863f17dead298563fe23aae341b6e677b146445b
-server:x86_64-unknown-linux-gnu 606436793 ec9d4622a0b942770842dd94da20d45abe08ec8db9b66f7c7f9d0fdff34580e5
+client:x86_64-unknown-linux-gnu 606571107 7b072f0b0906d59ba5e56f1160438f2142621e1fcec9b0d558d5458a114363ba
+client:x86_64-apple-darwin 606571083 73ac75ac045fd79be80781ddbd8dd303ebab7ba2d89215eca2efc90e1cdb681c
+client:aarch64-apple-darwin 606571076 1a0132b35c6096f4bb0feb79358b39eb8a71ebed20d1d248a70a252527107081
+server:x86_64-unknown-linux-gnu 606571115 a1305267eeebc0b4c1c2530e7fae547beaf83a45bcb490748f7badebf5c97111
 # END RELEASE ASSETS
 ASSETS
 }
@@ -136,6 +136,11 @@ release.json
 FILES
     fi
     tar -tzf "$work/package.tar.gz" > "$work/names" || fail 'Invalid package archive.'
+    # Guest-access releases add one fixed-purpose network helper. Older pinned
+    # packages remain installable, but cannot opt in to networking.
+    if [ "$mode" = server ] && grep -qx 'bin/boxd-network' "$work/names"; then
+        printf 'bin/boxd-network\n' >> "$work/expected"
+    fi
     sort "$work/expected" > "$work/expected.sorted"
     sort "$work/names" > "$work/names.sorted"
     cmp -s "$work/expected.sorted" "$work/names.sorted" || fail 'Unexpected archive contents.'
@@ -179,6 +184,12 @@ install_server() {
             if($1==10 || ($1==172 && $2>=16 && $2<=31) || ($1==192 && $2==168) ||
                ($1==100 && $2>=64 && $2<=127) || ($1==127 && $2==0 && $3==0 && $4==1)) ok=1
         } END { exit !ok }' || fail 'Use a private/VPN IPv4 address assigned to this server.'
+    uplink=${BOXD_NETWORK_UPLINK:-}
+    if [ -n "$uplink" ]; then
+        printf '%s\n' "$uplink" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$' || fail 'Invalid network uplink interface.'
+        [ -f "$work/package/bin/boxd-network" ] || fail 'This pinned release has no guest networking; a guest-access release is required.'
+        printf 'Networking requested: enable host IPv4 forwarding and filtered NAT via %s.\n' "$uplink"
+    fi
     printf '%s\n' \
         'This is a fresh-install pilot, not an upgrader. Fresh-host/reboot validation is outstanding.' \
         'Setup will use sudo to install Ubuntu packages: python3 openssl curl ca-certificates tar passwd.' \
@@ -188,12 +199,17 @@ install_server() {
     IFS= read -r confirmation < /dev/tty || fail 'Setup cancelled.'
     [ "$confirmation" = SETUP ] || fail 'Cancelled; no system changes made.'
     as_root apt-get update < /dev/tty
-    as_root apt-get install --no-install-recommends -y python3 openssl curl ca-certificates tar passwd < /dev/tty
-    as_root python3 "$work/package/install.py" --address "$address" --apply < /dev/tty
+    if [ -n "$uplink" ]; then
+        as_root apt-get install --no-install-recommends -y python3 openssl curl ca-certificates tar passwd iproute2 nftables < /dev/tty
+        as_root python3 "$work/package/install.py" --address "$address" --apply --network-uplink "$uplink" < /dev/tty
+    else
+        as_root apt-get install --no-install-recommends -y python3 openssl curl ca-certificates tar passwd < /dev/tty
+        as_root python3 "$work/package/install.py" --address "$address" --apply < /dev/tty
+    fi
 }
 
 main() {
-    version=0.1.1
+    version=0.2.0
     work='' staged='' tty_state=''
     trap cleanup EXIT
     trap 'exit 130' INT
@@ -207,7 +223,7 @@ main() {
         *) fail 'Usage: sh install.sh [client|server]' ;;
     esac
     platform
-    for tool in curl tar awk sed tr sort cmp mktemp stty; do
+    for tool in curl tar awk sed tr sort cmp mktemp stty grep; do
         command -v "$tool" >/dev/null 2>&1 || fail "Missing standard system tool: $tool"
     done
     command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || fail 'Missing system SHA-256 tool.'
