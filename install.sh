@@ -19,10 +19,10 @@ assets() {
     # Updated only after reviewing the release and its checksums.
     cat <<'ASSETS'
 # BEGIN RELEASE ASSETS
-client:x86_64-unknown-linux-gnu 0f333b72dea810d976cc15b14dd6c43e8995de41fc20b1b54e43e9897a048a68
-client:x86_64-apple-darwin 70d60d96d55e92371e1950b2f44ee7cc15705f5f9119a9702bd818d4b51e6a1e
-client:aarch64-apple-darwin 88e0bddb889155db223ffcbcc3fe19c43ee4b88800adc0cd8c3fd55ea005a719
-server:x86_64-unknown-linux-gnu ff00fea59b99f5523ef69b75dd890b916da58cc88b57dfa8e0f13051374520b8
+client:x86_64-unknown-linux-gnu 70658429814180737c73aa4bb675b88ca76e1cafba7e17fade812b631400c1f6
+client:x86_64-apple-darwin 565de4b70bf2fe5eaa836dda20f5d879c16a02830bd74e24fe8a0d50cb64c743
+client:aarch64-apple-darwin c470a4bea01ccc8bc3cc69e100c85e0e4c51965c75326f5230e71ad252e572d3
+server:x86_64-unknown-linux-gnu 36322fd5fcc56a8e5412a86a35de66566c19a5b91d394ae4fe6d71262a47a81a
 # END RELEASE ASSETS
 ASSETS
 }
@@ -138,6 +138,10 @@ check_upgrade_paths() {
 install_client() {
     found=$("$work/package/kiln" --version) || fail 'Downloaded client cannot run on this machine.'
     [ "$found" = "kiln $version" ] || fail 'Downloaded client version does not match release.'
+    if [ "$upgrade" = true ] && cmp -s "$destination" "$work/package/kiln"; then
+        printf 'kiln %s is already current; previous backup preserved.\n' "$version"
+        return
+    fi
     mkdir -p "$HOME/.local/bin"
     staged=$(mktemp "$HOME/.local/bin/.kiln.XXXXXXXX")
     cp "$work/package/kiln" "$staged"
@@ -195,12 +199,21 @@ configure_server() {
 }
 
 install_server() {
+    if [ "$existing_server" = true ]; then
+        command -v python3 >/dev/null 2>&1 || fail 'Existing Kiln installation requires python3.'
+        set -- --apply
+        if [ -n "$address" ]; then set -- "$@" --address "$address"; fi
+        if [ -n "$uplink" ]; then set -- "$@" --network-uplink "$uplink"; fi
+        if [ "$network" = true ]; then set -- "$@" --network; fi
+        as_root python3 "$work/package/install.py" "$@" < /dev/null
+        return
+    fi
     if [ -n "$uplink" ]; then
         [ -f "$work/package/bin/kiln-network" ] || fail 'This pinned release has no guest networking; a guest-access release is required.'
         printf 'Networking requested: enable host IPv4 forwarding and filtered NAT via %s.\n' "$uplink"
     fi
     printf '%s\n' \
-        'This is a fresh-install pilot, not an upgrader. Fresh-host/reboot validation is outstanding.' \
+        'Fresh Kiln installation. Fresh-host/reboot validation is outstanding.' \
         'Setup will use sudo to install Ubuntu packages: python3 openssl curl ca-certificates tar passwd.' \
         'The server command authorizes setup; resource/conflict checks still run before creating kiln accounts and services.' \
         'A failed setup retains runtime state for diagnosis; do not delete it and blindly retry.'
@@ -217,14 +230,14 @@ install_server() {
 }
 
 main() {
-    version=0.3.2
+    version=0.3.3
     work='' staged='' backup_staged='' lock='' upgrade=false
-    address='' uplink=${KILN_NETWORK_UPLINK:-} network=false
+    address='' uplink=${KILN_NETWORK_UPLINK:-} network=false existing_server=false
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
-    usage='Usage: sh install.sh [client [--upgrade]|server [--address IP] [--network|--network-uplink INTERFACE]]'
+    usage='Usage: sh install.sh [client|server [--address IP] [--network|--network-uplink INTERFACE]] (installs or updates automatically)'
     mode=${1:-client}
     case "$mode" in
         client|server) ;;
@@ -234,7 +247,7 @@ main() {
     if [ "$#" -gt 0 ]; then shift; fi
     while [ "$#" -gt 0 ]; do
         case "$mode:$1" in
-            client:--upgrade) upgrade=true; shift ;;
+            client:--upgrade) shift ;; # Backward-compatible alias; never required.
             server:--address|server:--network-uplink)
                 [ "$#" -ge 2 ] || fail "$usage"
                 [ -n "$2" ] || fail "$usage"
@@ -252,16 +265,24 @@ main() {
     if [ "$mode" = client ]; then
         [ -n "${HOME:-}" ] || fail 'HOME must be set.'
         destination="$HOME/.local/bin/kiln"
-        if [ "$upgrade" = true ]; then
-            check_upgrade_paths
-        elif [ -e "$destination" ] || [ -L "$destination" ]; then
-            fail 'Existing kiln preserved; rerun with: sh -s -- client --upgrade'
-        fi
         mkdir -p "$HOME/.local/bin"
         mkdir "$HOME/.local/bin/.kiln-install.lock" 2>/dev/null || fail 'Cannot lock client destination; another installer may be running. Inspect ~/.local/bin/.kiln-install.lock before removing a stale lock.'
         lock="$HOME/.local/bin/.kiln-install.lock"
+        if [ -e "$destination" ] || [ -L "$destination" ]; then
+            upgrade=true
+            check_upgrade_paths
+            current=$("$destination" --version) || fail 'Existing file is not a runnable Kiln client; refusing to overwrite.'
+            printf '%s\n' "$current" | awk '/^kiln [0-9]+\.[0-9]+\.[0-9]+$/ {ok++} END {exit !(NR==1 && ok==1)}' || fail 'Unrecognized installed client; refusing to overwrite.'
+            awk -v current="$current" -v target="$version" 'BEGIN {
+                sub(/^kiln /,"",current); split(current,a,"."); split(target,b,".");
+                for(i=1;i<=3;i++) {if(a[i]+0>b[i]+0) exit 1; if(a[i]+0<b[i]+0) exit 0}
+            }' || fail 'Installed client is newer than this installer; refusing to downgrade.'
+        fi
     else
-        configure_server
+        for path in /etc/kiln /opt/kiln /var/lib/kiln; do
+            if [ -e "$path" ] || [ -L "$path" ]; then existing_server=true; fi
+        done
+        if [ "$existing_server" = false ]; then configure_server; fi
         if [ "$(id -u)" != 0 ]; then
             command -v sudo >/dev/null 2>&1 || fail 'Server setup needs passwordless sudo or a root shell.'
             sudo -n true < /dev/null || fail 'Server setup needs passwordless sudo or a root shell; no password prompts are used.'
